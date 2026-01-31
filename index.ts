@@ -1,9 +1,8 @@
 import assert from 'assert';
 import { SHA1 } from 'bun';
-import prand from 'pure-rand';
-
 import { Database as Sqlite } from "bun:sqlite"
 
+import prand from 'pure-rand';
 
 export type Nullable<T> = T | null;
 export type Maybe<T> = T | undefined;
@@ -37,85 +36,7 @@ export const Errors = {
   ValueError
 } as const;
 
-class BigintArray {
-  private data: BigInt64Array;
-  private count: number = 0;
 
-  // Make it indexable
-  [idex: number]: bigint;
-
-  static from(data: BigInt64Array): BigintArray {
-    const arr = new BigintArray(data.length);
-    arr.data.set(data);
-    return arr;
-  }
-
-  constructor(length: number = 16) {
-    this.data = new BigInt64Array(length);
-
-    // Proxy makes it indexable
-    return new Proxy(this, {
-      get(target: BigintArray, prop: string | symbol): unknown {
-        if (typeof prop === 'string' && !isNaN(Number(prop))) {
-          return target.get(Number(prop));
-        }
-        return Reflect.get(target, prop);
-      },
-      set(target: BigintArray, prop: string | symbol, value: unknown): boolean {
-        if (typeof prop === 'string' && !isNaN(Number(prop))) {
-          target.put(Number(prop), value as bigint);
-          return true;
-        }
-        return Reflect.set(target, prop, value);
-      }
-    });
-  }
-
-  public push(value: bigint): void {
-    if (this.count === this.data.length) {
-      const newData = new BigInt64Array(this.data.length * 2);
-      newData.set(this.data);
-      this.data = newData;
-    }
-
-    this.data[this.count++] = value;
-  }
-
-  public concat(other: BigInt64Array): BigintArray {
-    const newLength = this.data.length + other.length;
-    const newData = new BigInt64Array(newLength);
-    newData.set(this.data.subarray(0, this.count), 0);
-    newData.set(other, this.count);
-    this.data = newData;
-    return this;
-  }
-
-  public view(): BigInt64Array {
-    return this.data.subarray(0, this.count);
-  }
-
-  public get length(): number {
-    return this.count;
-  }
-
-  public get(idx: number): bigint {
-    if (idx < 0 || idx >= this.count) {
-      throw new RangeError(
-        `Index ${idx} out of bounds for BigintArray of length ${this.count}`
-      );
-    }
-    return this.data[idx]!;
-  }
-
-  public put(idx: number, value: bigint): void {
-    if (idx < 0 || idx >= this.count) {
-      throw new RangeError(
-        `Index ${idx} out of bounds for BigintArray of length ${this.count}`
-      );
-    }
-    this.data[idx] = value;
-  }
-}
 
 export interface Random {
   random(): number;
@@ -155,8 +76,8 @@ export class Rng implements Random {
 }
 
 export interface Database {
-  set(key: string, value: Blob): Promise<void>;
-  get(key: string): Maybe<Blob>;
+  set(key: string, value: bigint[]): Promise<void>;
+  get(key: string): Maybe<bigint[]> ;
   del(key: string): void;
 }
 
@@ -181,7 +102,7 @@ export class KvStore implements Database {
     `);
   }
 
-  public get(key: string): Maybe<Blob> {
+  public get(key: string): Maybe<bigint[]> {
     const keyHash = KvStore.hashKey(key);
     const result = this.db.query(
       'SELECT value FROM kv WHERE key = ?'
@@ -191,15 +112,15 @@ export class KvStore implements Database {
       return;
     }
 
-    return new Blob([result.value]);
+    return bigintListFromBytes(result.value);
   }
 
-  public async set(key: string, value: Blob): Promise<void> {
+  public async set(key: string, value: bigint[]): Promise<void> {
     const keyHash = KvStore.hashKey(key);
     this.db.run(`
       INSERT OR REPLACE INTO kv (key, value)
       VALUES (? ,?);
-    `, [keyHash, await value.bytes()]);
+    `, [keyHash, bytesFromBigintList(value)]);
   }
 
   public del(key: string): void {
@@ -210,7 +131,36 @@ export class KvStore implements Database {
   }
 }
 
+export class MemoryDb implements Database {
+  static hashKey(key: string): string {
+    const hasher = new SHA1();
+    hasher.update(key);
+    return hasher.digest("hex").slice(0, 10);
+  }
 
+  private db: Map<string, Uint8Array> = new Map();
+
+  constructor() { }
+
+  public get(key: string): Maybe<bigint[]> {
+    const hashKey = MemoryDb.hashKey(key);
+    const value = this.db.get(hashKey);
+    if (!value) {
+      return undefined;
+    }
+    return bigintListFromBytes(value);
+  }
+
+  public async set(key: string, value: bigint[]): Promise<void> {
+    const hashKey = MemoryDb.hashKey(key);
+    this.db.set(hashKey, bytesFromBigintList(value));
+  }
+
+  public del(key: string): void {
+    const hashKey = MemoryDb.hashKey(key);
+    this.db.delete(hashKey);
+  }
+}
 
 export enum Status {
   // Test case didn't have enough data to complete
@@ -223,107 +173,107 @@ export enum Status {
   INTERESTING
 }
 
+export type TestFn = (testCase: TestCase) => void;
+
 export type RunTestInit = {
   maxExamples: number;
+  random: Random;
+  database: Database;
   quiet: boolean;
-} & Partial<HasRng & HasDb>;
+};
 
 export function runTest(
   name: string,
-  test: (tc: TestCase) => void,
-  options: RunTestInit = {
-    maxExamples: 100,
-    quiet: false,
-  }
-): void {
-  const markFailuresInteresting = (testCase: TestCase): void => {
-    try {
-      test(testCase);
-    } catch (error) {
-      if (!!testCase.status) {
+  options: Partial<RunTestInit>,
+): (test: TestFn) => void {
+  return function(testFn: TestFn): void {
+    
+    const markFailuresInteresting = (testCase: TestCase): void => {
+      try {
+        testFn(testCase);
+      } catch (error) {
+        if (testCase.status !== null) {
+          throw error;
+        }
+        testCase.markStatus(Status.INTERESTING);
+      }
+    };
+    
+    const db: Database = options.database ?? new MemoryDb();
+    const random: Random = options.random ?? new Rng();
+    const maxExamples: number = options.maxExamples ?? 100;
+  
+    const state = new TestingState(
+      random,
+      markFailuresInteresting,
+      maxExamples
+    );
+    
+    const previousFailure = db.get(name);
+    if (!!previousFailure) {
+      const choices = previousFailure.slice();
+      state.testFn(TestCase.ForChoices(choices));
+    }
+  
+    if (state.result === null) {
+      state.run();
+    }
+  
+    if (state.validTestCases === 0) {
+      throw new Errors.Unsatisfiable();
+    }
+  
+    if (state.result === null) {
+      db.del(name);
+    } else {
+      db.set(name, state.result);
+    }
+  
+    if (state.result !== null) {
+      const finalCase = TestCase.ForChoices(state.result, !options.quiet);
+      try {
+        testFn(finalCase);
+      } catch (error) {
+        // re-throw any errors from the final - and known to be interesting - test case
         throw error;
       }
-      testCase.markStatus(Status.INTERESTING);
     }
   };
-
-  const state = new TestingState(
-    options.random ?? new Rng(),
-    markFailuresInteresting,
-    options.maxExamples
-  );
-
-  const db: Database = options.database ?? new KvStore('.minithesis-cache');
-
-  const previousFailure = db.get(name);
-
-  if (!!previousFailure) {
-
-  }
-
-  if (!state.result) {
-    state.run();
-  }
-
-  if (state.validTestCases === 0) {
-    throw new Errors.Unsatisfiable();
-  }
-
-  if (!state.result) {
-    try {
-      db.del(name);
-    } catch (error) { }
-  } else {
-    db.set(name, new Blob([state.result.view()]));
-  }
-
-  if (!!state.result) {
-    test(TestCase.ForChoices(state.result, !options.quiet));
-  }
-}
-
-export interface HasSizeLimit {
-  maxSize: number;
-}
-
-export interface HasRng {
-  random: Random;
-}
-
-export interface HasDb {
-  database: Database;
-}
-
-export interface HasName {
-  name: string;
 }
 
 export type TestCaseInit = {
-  prefix: BigintArray;
-} & Partial<HasSizeLimit & HasRng>;
+  prefix: bigint[];
+  random: Random;
+  maxSize: number;
+  printResults: boolean
+}
 
 // A single generated test case which consists of an 
 // underlying set of choices that produce possibilities.
 export class TestCase {
 
-  public prefix: BigintArray = new BigintArray();
-  public targetingScore?: Maybe<number> = undefined;
-  public status?: Maybe<Status> = undefined;
-  public choices: BigintArray = new BigintArray();
+  public choices: bigint[] = [];
+  public prefix: bigint[] = [];
+  public status: Nullable<Status> = null;
+  public targetingScore: Nullable<number> = null;
 
   private random: Random;
+  private printResults: boolean = false
   private maxSize: number = Infinity;
-  private printResults: boolean = false;
   private depth: number = 0;
 
-  public static ForChoices(choices: BigintArray, printResults: boolean = false): TestCase {
-    return new TestCase({ prefix: choices }, printResults);
+  public static ForChoices(choices: bigint[], printResults: boolean = false): TestCase {
+    return new TestCase({
+      prefix: choices,
+      printResults,
+      maxSize: choices.length 
+    });
   }
 
-  constructor(options: TestCaseInit, printResults = false) {
-    this.prefix = options.prefix;
+  constructor(options: Partial<TestCaseInit>) {
+    this.prefix = options.prefix ?? [];
     this.random = options.random ?? new Rng();
-    this.printResults = printResults;
+    this.printResults = options.printResults ?? false;
     if (Number.isFinite(options.maxSize)) {
       this.maxSize = options.maxSize!;
     }
@@ -332,21 +282,23 @@ export class TestCase {
   // Returns a number in the range [0, n]
   public choice(n: bigint): bigint {
     const result = this.makeChoice(n, () => this.random.randint(0n, n));
+    
     if (this.shouldPrint()) {
       console.log(`choice(${n}): ${result}`);
     }
+
     return result;
   }
 
   // Retrun true with probability ``p``
-  public weighted(p: number): bigint {
-    let result: bigint;
+  public weighted(p: number): boolean {
+    let result: boolean;
     if (p <= 0) {
-      result = this.forcedChoice(0n);
+      result = Boolean(this.forcedChoice(0n));
     } else if (p >= 1) {
-      result = this.forcedChoice(1n);
+      result = Boolean(this.forcedChoice(1n));
     } else {
-      result = this.makeChoice(1n, () => this.random.random() <= p ? 1n : 0n);
+      result = Boolean(this.makeChoice(1n, () => this.random.random() <= p ? 1n : 0n));
     }
 
     if (this.shouldPrint()) {
@@ -365,11 +317,11 @@ export class TestCase {
       );
     }
 
-    if (this.status) {
+    if (this.status !== null) {
       throw new Errors.Frozen();
     }
 
-    if (this.choice.length >= this.maxSize) {
+    if (this.choices.length >= this.maxSize) {
       this.markStatus(Status.OVERRUN);
     }
 
@@ -411,7 +363,7 @@ export class TestCase {
     }
 
     if (this.shouldPrint()) {
-      console.log(`any(${possibility}): ${result}`);
+      console.log(`any(${possibility}): [${result}]`);
     }
 
     return result;
@@ -419,7 +371,7 @@ export class TestCase {
 
   // Set the status for this case and throw StopTest
   public markStatus(status: Status): never {
-    if (this.status) {
+    if (this.status !== null) {
       throw new Errors.Frozen();
     }
 
@@ -434,14 +386,14 @@ export class TestCase {
   // Make a choice in [0, n], by calling rndMethod if randomness is needed
   private makeChoice(n: bigint, rndMethod: () => bigint): bigint | never {
     if (!isValidUint64(n)) {
-      throw new Errors.ValueError(`forcedChoice(${n}): n must be valid uint64`);
+      throw new Errors.ValueError(`makeChoice(${n}): n must be valid uint64`);
     }
 
-    if (this.status) {
+    if (this.status !== null) {
       throw new Errors.Frozen();
     }
 
-    if (this.choice.length >= this.maxSize) {
+    if (this.choices.length >= this.maxSize) {
       this.markStatus(Status.OVERRUN);
     }
 
@@ -452,7 +404,7 @@ export class TestCase {
       result = rndMethod();
     }
 
-    this.choices.push(n);
+    this.choices.push(result);
     if (result > n) {
       this.markStatus(Status.INVALID);
     }
@@ -466,16 +418,13 @@ export class TestCase {
 //
 // Pass one of these to TestCase.any to get a concrete value.
 export class Possibility<T> {
-  public produce: (testCase: TestCase) => T;
   public name: string;
-
-  constructor(produce: (testCase: TestCase) => T, name?: Maybe<string>) {
-    this.produce = produce;
-    if (name) {
-      this.name = name;
-    } else {
-      this.name = produce.name || 'noname';
-    }
+  
+  constructor(
+    public produce: (testCase: TestCase) => T,
+    name?: string
+  ) {
+    this.name = name ?? produce.name ?? 'unknown possibility';
   }
 
   public toString(): string {
@@ -544,7 +493,7 @@ export function lists<U>(
     while (true) {
       if (result.length < minSize) {
         tc.forcedChoice(1n);
-      } else if (result.length + 1 >= Number(maxSize)) {
+      } else if (result.length + 1 >= maxSize) {
         tc.forcedChoice(0n);
         break
       } else if (!tc.weighted(0.9)) {
@@ -578,7 +527,7 @@ export function nothing(): Possibility<never> {
 }
 
 // Possible values can be any value possible for one of ``possibilities``
-export function mix_of<T>(...possibilities: Possibility<T>[]): Possibility<T> {
+export function mixOf<T>(...possibilities: Possibility<T>[]): Possibility<T> {
   if (!possibilities?.length) {
     return nothing();
   }
@@ -590,12 +539,13 @@ export function mix_of<T>(...possibilities: Possibility<T>[]): Possibility<T> {
   );
 }
 
-// TODO@iangregson :: does this work / make sense when ts doesn't have a tuple type?
 // Any tuple t of of length len(possibilities) such that t[i] is possible
 // for possibilities[i] is possible.
-export function tuples(...possibilities: Possibility<any>[]): Possibility<any> {
-  return new Possibility<any>(
-    (tc: TestCase): any[] => possibilities.map(p => tc.any(p)),
+export function tuples<T extends readonly any[]>(
+  ...possibilities: { [K in keyof T]: Possibility<T[K]> }
+): Possibility<T> {
+  return new Possibility(
+    (tc: TestCase) => possibilities.map(p => tc.any(p)) as unknown as T,
     `tuples(${possibilities.map(p => p.name).join(', ')})`
   );
 }
@@ -612,12 +562,21 @@ export function tuples(...possibilities: Possibility<any>[]): Possibility<any> {
 // paths as an array inline. For simplicity we don't
 // do that here.
 // XXX The Tree type is recursive
-export type Tree = Map<bigint, Status | Map<bigint, unknown>>;
+export type Tree = Map<bigint, Status | Tree>;
 
 // We cap the maximum amount of entropy a test case can use.
 // This prevents cases where the generated test case size explodes
 // by effectively rejection
-const BUFFER_SIZE = 8 * 1024;
+let BUFFER_SIZE = 8 * 1024;
+export function setBufferSize(size: number): { restore: () => void } {
+  const oldSize = BUFFER_SIZE;
+  BUFFER_SIZE = size;
+  return {
+    restore: () => {
+      BUFFER_SIZE = oldSize;
+    }
+  };
+}
 
 // Returns a cached version of a function that maps
 // a choice sequence to the status of calling a test function
@@ -629,101 +588,91 @@ const BUFFER_SIZE = 8 * 1024;
 // You can safely omit implementing this at the cost of
 // somewhat increased shrinking time.
 export class CachedTestFunction {
-
-
   private tree: Tree = new Map();
-  private testFunction: (testCase: TestCase) => void;
 
-  constructor(testFunction: (testCase: TestCase) => void) {
-    this.testFunction = testFunction;
-  }
+  constructor(private testFunction: TestFn) {}
 
-  public call(choices: BigintArray): Status {
+  // Do the thing and return the status i.e. actually run the test case and determine it's status
+  public call(choices: bigint[]): Status {
     // XXX The type of node is problematic
-    let node: any = this.tree;
-    try {
-      for (const c of choices.view()) {
-        node = node[Number(c)];
-        // markStatus was called at this point so future choices don't matter
-        switch (node) {
-          case
-            Status.INTERESTING,
-            Status.VALID,
-            Status.INVALID:
-            return node;
-          case Status.OVERRUN:
-            assert(false, 'Test case overran');
-        }
+    let node: Maybe<Tree | Status> = this.tree;
+    for (const c of choices) {
+      node = node.get(c);
+      if (!node) {
+        break;
       }
-      // If we never enetered an unkown region of the tree, or hti a Status, then 
-      // we know that another choice will be made next and the result will overrun.
-      return Status.OVERRUN;
-    } catch (error) { }
+      if (node instanceof Map) {
+        // moar tree keep going 
+        continue;
+      } else {
+        // Return a legit status 
+        if (typeof node === 'number') {
+          return node;
+        }
 
-    // Now we have to actually call the test function to find out what happens
+        // If we never enetered an unkown region of the tree, or hit a Status, then 
+        // we know that another choice will be made next and the result will overrun.
+        return Status.OVERRUN;
+      }
+    }
+
+    // Now we have to actually call the test function to find out what happens (i.e. cache miss)
     const testCase = TestCase.ForChoices(choices);
     this.testFunction(testCase);
-    assert(testCase.status !== undefined, 'Test function did not mark status');
+    assert(testCase.status !== null, 'Test function did not mark status');
 
     // We enter the choices made in a tree.
-    node = this.tree;
-    testCase.choices.view().forEach((c, i) => {
-      if (
-        BigInt(i) + 1n < testCase.choices.length
-        || testCase.status === Status.OVERRUN
-      ) {
-        try {
-          node = node.get(c);
-        } catch (error) {
-          node.set(c, new Map());
+    // Store result in tree
+    let treeNode = this.tree;
+    for (let i = 0; i < testCase.choices.length; i++) {
+      const choice = testCase.choices[i]!;
+
+      if (i + 1 < testCase.choices.length || testCase.status === Status.OVERRUN) {
+        if (!treeNode.has(choice)) {
+          treeNode.set(choice, new Map());
+        }
+        const next = treeNode.get(choice);
+        if (next instanceof Map) {
+          treeNode = next;
         }
       } else {
-        node.set(c, testCase.status);
+        treeNode.set(choice, testCase.status);
       }
-    });
-    return testCase.status!;
-  }
+    }
 
+    return testCase.status;
+  }
 }
 
-// We need a custom SortKey type to replicate Python's ability to
-// use tuples as sort keys
-export type SortKey = [number, BigintArray];
-
 export class TestingState {
-  private random: Random;
-  private _testFunction: (testCase: TestCase) => void;
-  private maxExamples: number;
-  private calls: number = 0;
+  public calls: number = 0;
   public validTestCases: number = 0;
-  public result?: Maybe<BigintArray>;
-  public bestScoring?: Maybe<{
+  public result: Nullable<bigint[]> = null;
+  public bestScoring: Nullable<{
     best: number;
-    choices: BigintArray;
-  }>;
+    choices: bigint[];
+  }> = null;
   public testIsTrivial: boolean = false;
 
   constructor(
-    random: Random,
-    testFunction: (testCase: TestCase) => void,
-    maxExamples: number,
-  ) {
-    this.random = random;
-    this.maxExamples = maxExamples;
-    this._testFunction = testFunction;
-  }
+    private random: Random,
+    private testFunction: TestFn,
+    public maxExamples: number,
+  ) {}
 
-  // Returns a key that can be used for the shrinking order of test cases
-  private sortKey(choices: BigintArray): SortKey {
-    return [choices.length, choices];
-  }
-
-  public testFunction(testCase: TestCase): void {
+  public testFn(testCase: TestCase): void {
     try {
-      this._testFunction(testCase);
-    } catch (error) { }
+      this.testFunction(testCase);
+    } catch (error) {
+      if (error instanceof Errors.StopTest) {
+        // pass
+      } else {
+        // unexpected error - re-raise
+        throw error;
+      }
+    }
 
-    if (!testCase.status) {
+    if (testCase.status === null) {
       testCase.status = Status.VALID;
     }
 
@@ -738,21 +687,18 @@ export class TestingState {
     if (testCase.status >= Status.VALID) {
       this.validTestCases += 1;
 
-      if (!!testCase.targetingScore) {
-        let relevantInfo = {
+      if (testCase.targetingScore !== null) {
+        let newScoringInfo = {
           best: testCase.targetingScore,
           choices: testCase.choices
         };
 
-        if (!this.bestScoring) {
-          this.bestScoring = relevantInfo;
+        if (this.bestScoring === null) {
+          this.bestScoring = newScoringInfo;
         } else {
-          const { best } = relevantInfo;
-          if (
-            testCase.targetingScore &&
-            testCase.targetingScore > best
-          ) {
-            this.bestScoring = relevantInfo;
+          const { best } = this.bestScoring;
+          if (testCase.targetingScore > best) {
+            this.bestScoring = newScoringInfo;
           }
         }
       }
@@ -760,43 +706,47 @@ export class TestingState {
 
     if (
       testCase.status === Status.INTERESTING &&
-      (!this.result || this.sortKey(testCase.choices) < this.sortKey(this.result))
+      (this.result === null || bigintListsLessThan(testCase.choices, this.result))
     ) {
-      this.result = testCase.choices;
+      this.result = testCase.choices.slice();
     }
   }
 
   // In any test cases have had ``target()`` called on them, do a simple hill-climb
   // algorithm to try and optimise that target score.
   public target(): void {
-    if (!!this.result || !this.bestScoring) {
+    if (this.result !== null || this.bestScoring === null) {
       return;
     }
 
     // Can we improve by changing choices[i] by ``step``?
     const adjust = (i: number, step: bigint): boolean => {
-      assert(!!this.bestScoring, "no best scoring info");
+      assert(this.bestScoring !== null, "no best scoring info");
       const { best: score, choices } = this.bestScoring;
-      if (choices[i]! + step < 0 || !isValidUint64(choices[i]!)) {
+      if (!isValidUint64(choices[i]! + step)) {
         return false;
       }
-      let attempt = choices.view()
+      
+      let attempt = choices.slice();
       attempt[i]! += step;
       const testCase = new TestCase({
-        prefix: BigintArray.from(attempt),
+        prefix: attempt,
         random: this.random,
         maxSize: BUFFER_SIZE,
       });
-      this.testFunction(testCase);
-      assert(!!testCase.status, "test case should have been resolved to a status");
+      
+      this.testFn(testCase);
+      assert(testCase.status !== null, "test case should have been resolved to a status");
       return (
         testCase.status >= Status.VALID &&
-        !!testCase.targetingScore &&
+        testCase.targetingScore !== null &&
         testCase.targetingScore > score
       );
     };
 
     while (this.shouldKeepGenerating()) {
+      if (this.bestScoring === null) break;
+
       const i = this.random.randrange(0, this.bestScoring.choices.length);
       let sign = 0n;
 
@@ -828,14 +778,17 @@ export class TestingState {
 
   public run(): void {
     this.generate();
+    let self = this;
     this.target();
+    self = this;
     this.shrink();
+    self = this;
   }
 
   private shouldKeepGenerating(): boolean {
     return (
       !this.testIsTrivial &&
-      !this.result &&
+      this.result === null &&
       this.validTestCases < this.maxExamples &&
 
       // We impose a limit on the maximum number of calls as
@@ -849,12 +802,16 @@ export class TestingState {
   // Run random generation until either we have found an interesting test case or 
   // hit the limit of how many test cases we should evaluate.
   private generate(): void {
-    while (this.shouldKeepGenerating() && (
-      !this.bestScoring || this.validTestCases < Math.floor(this.maxExamples / 2)
-    )) {
-      this.testFunction(
-        new TestCase({ prefix: new BigintArray(), random: this.random, maxSize: BUFFER_SIZE })
-      )
+    while (
+      this.shouldKeepGenerating() &&
+      (this.bestScoring === null || this.validTestCases <= Math.floor(this.maxExamples / 2))
+    ) {
+      const testCase = new TestCase({
+        prefix: [],
+        random: this.random,
+        maxSize: BUFFER_SIZE,
+      });
+      this.testFn(testCase);
     }
   }
 
@@ -865,7 +822,7 @@ export class TestingState {
 
   // https://drmaciver.github.io/papers/reduction-via-generation-preview.pdf
   private shrink(): void {
-    if (!this.result) {
+    if (this.result === null) {
       return;
     }
 
@@ -873,24 +830,24 @@ export class TestingState {
     // so we use a cached version of the test function to avoid wasted cycles.
     // This also allows us to ignore cases where we try e.g. a prefix of choices
     // that is guaranteed not to work.
-    let cached = new CachedTestFunction(this._testFunction);
+    let cached = new CachedTestFunction(this.testFn.bind(this));
 
-    const consider = (choices: BigintArray): boolean => {
-      if (choices == this.result) {
+    const consider = (choices: bigint[]): boolean => {
+      if (bigintListsEqual(this.result!, choices)) {
         return true;
       }
 
       return cached.call(choices) === Status.INTERESTING;
     };
 
-    assert(consider(this.result));
+    assert(consider(this.result), "initial result should be interesting or shouldn't be shrinking");
 
     // We are going to perform a number of transformations to the cyrrent result, 
     // iterating until none of them make any progress - i.e. until we make it through 
     // an entire iteration of the loop without changing the result.
-    let prev = null;
-    while (prev !== this.result) {
-      prev = this.result;
+    let prev: Maybe<bigint[]>;
+    while (!bigintListsEqual(prev, this.result)) {
+      prev = this.result.slice();
 
       // A note on weird loop order: We iterate backwards
       // through the choice sequence rather than forwards,
@@ -938,10 +895,10 @@ export class TestingState {
             i -= 1;
             continue;
           }
-          const attempt = BigintArray.from(this.result!
-            .view()
-            .slice(0, i)
-          ).concat(this.result!.view().slice(i + k));
+          const attempt = [
+            ...this.result.slice(0, i),
+            ...this.result.slice(i + k)
+          ];
 
           assert(attempt.length < this.result.length,
             "attempt should be smaller than current result");
@@ -970,17 +927,17 @@ export class TestingState {
 
       // Attempts tor replace some indices in the current result with new values.
       // Useful for some purely lexicographic reductions that we are about to perform.
-      const replace = (values: Readonly<Map<number, bigint>>): boolean => {
-        assert(!!this.result, "no result to replace values in");
-        let attempt = BigintArray.from(this.result.view());
-        for (const [i, v] of values.entries()) {
+      const replace = (values: Map<number, bigint>): boolean => {
+        assert(this.result !== null, "no result to replace values in");
+        let attempt = this.result.slice();
+        for (const [i, v] of values) {
           // The size of this.result can change during shrinking. If that happens,
           // stop attempting to make use of these replacements because some other 
           // shrink pass is better to run now.
           if (i >= attempt.length) {
             return false;
           }
-          attempt.put(i, BigInt(v));
+          attempt[i] = v;
         }
 
         return consider(attempt);
@@ -992,21 +949,23 @@ export class TestingState {
       k = 8;
       while (k > 1) {
         let i = this.result.length - k;
+        while (i > 0) {
+          const zeros = new Map<number, bigint>();
+          for (let j = i; j < i + k; j++) {
+            zeros.set(j, 0n);
+          }
 
-        const m = new Map<number, bigint>();
-        for (let j = i; j < i + k; j++) {
-          m.set(j, 0n);
+          if (replace(zeros)) {
+            // If we succeeded then all of [i, i + k] is zero so we adjust i so that the 
+            // next region does not overlap with this at all.
+            i -= k;
+          } else {
+            // Other we might still be able to zero some other these values but not the last 
+            // one, so we just go back one. 
+            i -= 1;
+          }
         }
-
-        if (replace(m)) {
-          // If we succeeded then all of [i, i + k] is zero so we adjust i so that the 
-          // next region does not overlap with this at all.
-          i -= k;
-        } else {
-          // Other we might still be able to zero some other these values but not the last 
-          // one, so we just go back one. 
-          i -= 1;
-        }
+        k -= 1;
       }
 
       // Now try replacing each choice with a smaller value by doing a binary search. This 
@@ -1020,7 +979,63 @@ export class TestingState {
       }
 
       // NB from here on this is just showing off cool shrinker tricks 
-      // TODO@iangregson :: add the cool shrinker tricks 
+
+      // Try sorting out of order ranges of choices, as ``sort(x) <= x``,
+      // so this is always a lexicographic reduction.
+      k = 8;
+      while (k > 1) {
+        for (let i = this.result.length - k - 1; i >= 0; i--) {
+          const candidate = [
+            ...this.result.slice(0, i),
+            ...this.result.slice(i, i + k)
+              .slice()
+              .sort((a, b) => toNumber(a - b)),
+            ...this.result.slice(i + k),
+          ];
+
+          consider(candidate);
+        }
+
+        k -= 1;
+      }
+
+      // Try adjusting nearby pairs of integers by redistributing value
+      // between them. This is useful for tests that depend on the
+      // sum of some generated values.
+      for (const k of [2, 1]) {
+        for (let i = this.result.length - 1 - k; i >= 0; i--) {
+          const j = i + k;
+
+          // This check is necessary because the previous changes
+          // might have shrunk the size of result
+          if (j < this.result.length) {
+            // Try swapping out-of-order pairs
+            if (this.result[i]! > this.result[j]!) {
+              const m = new Map<number, bigint>();
+              m.set(j, this.result[i]!);
+              m.set(i, this.result[j]!);
+              replace(m);
+            }
+
+            // j could be out of range if the previous swap succeeded
+            if (j < this.result.length && this.result[i]! > 0) {
+              const previousI = this.result[i]!;
+              const previousJ = this.result[j]!;
+
+              binSearchDown(
+                0n,
+                previousI,
+                (v: bigint) => {
+                  const m = new Map<number, bigint>();
+                  m.set(i, v);
+                  m.set(j, previousJ + (previousI - v));
+                  return replace(m);
+                }
+              );
+            }
+          }
+        }
+      }
     }
   }
 }
@@ -1051,4 +1066,88 @@ function binSearchDown(lo: bigint, hi: bigint, f: (v: bigint) => boolean): bigin
 // Check is valid uint64 
 function isValidUint64(n: bigint): boolean {
   return n >= 0n && n < (1n << 64n);
+}
+
+// Check bigint will go to Number safely
+export function toNumber(v: bigint): number {
+  if (v > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Errors.ValueError(`${v} is too big to be a Number`);
+  }
+  if (v < BigInt(Number.MIN_SAFE_INTEGER)) {
+    throw new Errors.ValueError(`${v} is too small to be a Number`);
+  }
+  return Number(v);
+}
+
+// CHeck two bigint arrays for equality
+function bigintListsEqual(one?: Maybe<bigint[]>, other?: Maybe<bigint[]>): boolean {
+  if (!one) {
+    return false;
+  }
+
+  if (!other) {
+    return false;
+  }
+
+  if (one.length !== other.length) {
+    return false;
+  }
+
+  for (let i = 0; i < one.length; i++) {
+    if (one[i] !== other[i]) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// Check bigint list A is smaller than bigint list B in shortlex order
+function bigintListsLessThan(a: bigint[], b: bigint[]): boolean {
+  // length first
+  if (a.length > b.length) {
+    return false;
+  }
+  if (a.length < b.length) {
+    return true;
+  }
+
+  for (let i = 0; i < a.length; i++) {
+    if (a[i]! < b[i]!) {
+      return true;
+    }
+    if (a[i]! > b[i]!) {
+      return false;
+    }
+  }
+
+  return false; // arrays are equal
+}
+
+function bigintListFromBytes(bytes: Uint8Array): bigint[] {
+  if (bytes.length % 8 !== 0) {
+    throw new Error("Byte array length must be multiple of 8");
+  }
+
+  const choices: bigint[] = [];
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+
+  for (let i = 0; i < bytes.length; i += 8) {
+    choices.push(view.getBigUint64(i, false)); // false = big-endian
+  }
+
+  return choices;
+}
+
+function bytesFromBigintList(choices: bigint[]): Uint8Array {
+  const buffer = new ArrayBuffer(choices.length * 8);
+  const view = new DataView(buffer);
+
+  for (let i = 0; i < choices.length; i++) {
+    // Convert bigint to 64-bit big-endian bytes
+    const value = choices[i]!;
+    view.setBigUint64(i * 8, value, false); // false = big-endian
+  }
+
+  return new Uint8Array(buffer);
 }
