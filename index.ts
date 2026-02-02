@@ -528,14 +528,14 @@ export function nothing(): Possibility<never> {
 
 // Possible values can be any value possible for one of ``possibilities``
 export function mixOf<T>(...possibilities: Possibility<T>[]): Possibility<T> {
-  if (!possibilities?.length) {
+  if (possibilities.length === 0) {
     return nothing();
   }
 
   return new Possibility<T>(
     (tc: TestCase): T =>
-      tc.any(possibilities[Number(tc.choice(BigInt(possibilities.length)))]!),
-    `mix_of(${possibilities.map(p => p.name).join(', ')})`
+      tc.any(possibilities[toNumber(tc.choice(BigInt(possibilities.length - 1)))]!),
+    `mixOf(${possibilities.map(p => p.name).join(', ')})`
   );
 }
 
@@ -595,25 +595,31 @@ export class CachedTestFunction {
   // Do the thing and return the status i.e. actually run the test case and determine it's status
   public call(choices: bigint[]): Status {
     // XXX The type of node is problematic
-    let node: Maybe<Tree | Status> = this.tree;
-    for (const c of choices) {
-      node = node.get(c);
-      if (!node) {
-        break;
-      }
-      if (node instanceof Map) {
-        // moar tree keep going 
-        continue;
-      } else {
-        // Return a legit status 
-        if (typeof node === 'number') {
-          return node;
+    const findCached = (choices: bigint[]): Nullable<Status> => {
+      let node: Maybe<Tree | Status> = this.tree;
+      for (const c of choices) {
+        let n: Maybe<Tree | Status> = node.get(c);
+        if (n === undefined) {
+          return null;
         }
-
-        // If we never enetered an unkown region of the tree, or hit a Status, then 
-        // we know that another choice will be made next and the result will overrun.
-        return Status.OVERRUN;
+        if (!(n instanceof Map)) {
+          if (n === Status.OVERRUN) {
+            return null;
+          }
+          return n;
+        } else {
+          node = n;
+        }
       }
+      // if we never entered an unkown region of the tree or hit a Status,
+      // then we know that another choice will be made next. and the result
+      // will overrun
+      return Status.OVERRUN;
+    };
+
+    const cached = findCached(choices);
+    if (cached !== null) {
+      return cached;
     }
 
     // Now we have to actually call the test function to find out what happens (i.e. cache miss)
@@ -623,20 +629,19 @@ export class CachedTestFunction {
 
     // We enter the choices made in a tree.
     // Store result in tree
-    let treeNode = this.tree;
+    let node = this.tree;
     for (let i = 0; i < testCase.choices.length; i++) {
       const choice = testCase.choices[i]!;
 
       if (i + 1 < testCase.choices.length || testCase.status === Status.OVERRUN) {
-        if (!treeNode.has(choice)) {
-          treeNode.set(choice, new Map());
+        let n: Maybe<Tree | Status> = node.get(choice);
+        if (!(n instanceof Map)) {
+          n = new Map();
+          node.set(choice, n);
         }
-        const next = treeNode.get(choice);
-        if (next instanceof Map) {
-          treeNode = next;
-        }
+        node = n;
       } else {
-        treeNode.set(choice, testCase.status);
+        node.set(choice, testCase.status);
       }
     }
 
@@ -778,11 +783,8 @@ export class TestingState {
 
   public run(): void {
     this.generate();
-    let self = this;
     this.target();
-    self = this;
     this.shrink();
-    self = this;
   }
 
   private shouldKeepGenerating(): boolean {
