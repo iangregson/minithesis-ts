@@ -1,20 +1,16 @@
 # minithesis-ts
 
-⚠️ **Work in progress**
+A typescript/bun port of [minithesis](https://github.com/DRMacIver/minithesis).
 
-Hopefully one day this will be a typescript port of
-[minithesis](https://github.com/DRMacIver/minithesis) but for now it's still very much a
-work in prorgess. There's no tests yet and it's likely nothing works.
-
---------------------------------------------
+Building this port alongside reading [the paper](https://drmaciver.github.io/papers/reduction-via-generation-preview.pdf) 
+was instructive. Many thanks to David R. MacIver.
 
 ## Prerequisites
 
 - [Install Bun](https://bun.com/docs/installation)
 
-## Install, typecheck and test
+## Install check and test
 
 ```bash
-bun install 
-bun check; bun test
+bun install; bun check; bun test
 ```
