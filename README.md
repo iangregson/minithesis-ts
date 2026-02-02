@@ -3,7 +3,7 @@
 A typescript/bun port of [minithesis](https://github.com/DRMacIver/minithesis).
 
 Building this port alongside reading [the paper](https://drmaciver.github.io/papers/reduction-via-generation-preview.pdf) 
-was instructive. Many thanks to David R. MacIver.
+was instructive to say the least. Many thanks to David R. MacIver.
 
 ## Prerequisites
 
