@@ -16,7 +16,8 @@ import {
   TestCase,
   TestingState,
   toNumber,
-  tuples
+  tuples,
+  type Random
 } from ".";
 
 describe("test finds small list", () => {
@@ -524,4 +525,178 @@ test("test forced choice bounds", () => {
   }).toThrow();
 });
 
+test("test failure from hypothesis 1", () => {
+  expect(() => {
+    runTest("test failure from hypothesis 1", {
+      random: new Rng(100),
+      database: new MemoryDb(),
+      maxExamples: 1000
+    })((testCase) => {
+      const n1 = testCase.weighted(0.0);
+      if (!n1) {
+        const n2 = testCase.choice(511n);
+        if (n2 === 112n) {
+          const n3 = testCase.choice(511n);
+          if (n3 === 124n) {
+            throw new Error('failure');
+          } else if (n3 === 93n) {
+            throw new Error('failure');
+          } else {
+            testCase.markStatus(Status.INVALID);
+          }
+        } else if (n2 == 93n) {
+          throw new Error('failure');
+        } else {
+          testCase.markStatus(Status.INVALID);
+        }
+      }
+    });
+  }).toThrow('failure');
+});
 
+test("test failure from hypothesis 2", () => {
+  expect(() => {
+    runTest("test failure from hypothesis 2", {
+      random: new Rng(0),
+      database: new MemoryDb(),
+      maxExamples: 1000
+    })((testCase) => {
+      const n1 = testCase.choice(6n);
+      if (n1 === 6n) {
+        const n2 = testCase.weighted(0.0);
+        if (!n2) {
+          throw new Error('failure');
+        }
+      } else if (n1 == 4n) {
+        const n3 = testCase.choice(0n);
+        if (n3 === 0n) {
+          throw new Error('failure');
+        } else {
+          testCase.markStatus(Status.INVALID);
+        }
+      } else if (n1 == 2n) {
+          throw new Error('failure');
+      } else {
+        testCase.markStatus(Status.INVALID);
+      }
+    });
+  }).toThrow('failure');
+});
+
+describe("give minithesis a workout", () => {
+  const rng1 = new Rng(17);
+  const k = 835;
+  
+  for (let i = 0; i < k; i++) {
+    test(`give minithesis a workout ${i + 1}/${k}`, () => {
+      const seed = rng1.randint(0n, 1000n);
+      const rng2 = new Rng(toNumber(seed));
+      const maxExamples = rng1.randint(1n, 100n);
+  
+      const database = new MemoryDb();
+      
+      const tree = newNode();
+      let failed = false;
+      let calls = 0;
+      let valid = 0;
+
+      expect(() => {
+        try {
+          runTest(`give minithesis a workout ${i + 1}/${k}`, {
+            random: rng2,
+            database,
+            maxExamples: toNumber(maxExamples),
+            quiet: true
+          })((testCase) => {
+            let node = tree;
+            calls++;
+  
+            while (true) {
+              if (node[0] === null) {
+                node[0] = drawMethodCall(rng1);
+              }
+  
+              const [method, ...rest] = node[0];
+  
+              if (method === "markStatus" && rest[0] === Status.INTERESTING) {
+                failed = true;
+                throw new Error('failure');
+              }
+  
+              if (method === "markStatus" && rest[0] === Status.VALID) {
+                valid++;
+                return;
+              }
+  
+              let result: any;
+              switch (method) {
+                case "markStatus":
+                  testCase.markStatus(rest[0] as Status);
+                  return;
+                case "target":
+                  testCase.target(rest[0] as number);
+                  result = undefined;
+                  break;
+                case "choice":
+                  result = testCase.choice(rest[0] as bigint);
+                  break;
+                case "weighted":
+                  result = testCase.weighted(rest[0] as number);
+                  break;
+              }
+  
+              if (!node[1].has(result)) {
+                node[1].set(result, newNode());
+              }
+              node = node[1].get(result)!;
+            }
+          });
+        } catch (error) {
+          if ((error as Error).message === 'failure') {
+            failed = true;
+          } else if (error instanceof Errors.Unsatisfiable) {
+            return;
+          } else {
+            throw error;
+          }
+        }
+  
+        if (!failed) {
+          expect(valid).toBeLessThanOrEqual(maxExamples);
+          expect(calls).toBeLessThanOrEqual(maxExamples * 10n);
+        }
+      }).not.toThrow();
+    }, { timeout: 15000 });
+  }
+
+  type MethodCall =
+    | ["markStatus", Status]
+    | ["target", number]
+    | ["choice", bigint]
+    | ["weighted", number];
+
+  type TreeNode = [MethodCall | null, Map<any, TreeNode>];
+
+  function newNode(): TreeNode {
+    return [null, new Map()];
+  }
+
+  function drawMethodCall(rng: Random): MethodCall {
+    const methodType = Number(rng.randint(0n, 3n));
+    switch (methodType) {
+      case 0: {
+        const statuses = [Status.INVALID, Status.VALID, Status.INTERESTING];
+        const statusIndex = Number(rng.randint(0n, BigInt(statuses.length - 1)));
+        return ["markStatus", statuses[statusIndex] as Status];
+      }
+      case 1:
+        return ["target", rng.random()];
+      case 2:
+        return ["choice", rng.randint(0n, 1000n)];
+      case 3:
+        return ["weighted", rng.random()];
+      default:
+        throw new Error("Unreachable");
+    }
+  }
+});
